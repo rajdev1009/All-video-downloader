@@ -11,7 +11,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, 
 from flask import Flask
 
 # ─────────────────────────────────────────
-#  CONFIGURATION  –  Set via Environment Variables on Render
+#  CONFIGURATION
 # ─────────────────────────────────────────
 API_ID   = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
@@ -24,60 +24,64 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-#  FLASK HEALTH-CHECK SERVER  (keeps Render alive)
+#  FLASK HEALTH-CHECK
 # ─────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def health():
-    return "Bot is running!", 200
+    return "Bot is running perfectly!", 200
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 # ─────────────────────────────────────────
-#  PYROGRAM BOT CLIENT
+#  PYROGRAM CLIENT
 # ─────────────────────────────────────────
 app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# In-memory store: { user_id: { "url": ..., "formats": [...] } }
 user_data: dict = {}
 
 # ─────────────────────────────────────────
-#  HELPERS
+#  2026 BYPASS HEADERS & SETTINGS
 # ─────────────────────────────────────────
-SUPPORTED_DOMAINS = ("youtube.com", "youtu.be", "instagram.com", "facebook.com", "fb.watch")
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+COOKIES_FILE = "cookies.txt" # Ensure this file is in your repo if links fail
 
-def is_supported(url: str) -> bool:
-    return any(d in url for d in SUPPORTED_DOMAINS)
-
-def detect_platform(url: str) -> str:
-    if "youtube.com" in url or "youtu.be" in url:
-        return "🎬 YouTube"
-    if "instagram.com" in url:
-        return "📸 Instagram"
-    if "facebook.com" in url or "fb.watch" in url:
-        return "📘 Facebook"
-    return "🌐 Unknown"
+def get_yt_dlp_base_cmd(url: str):
+    """Returns the base command with all bypass flags for 2026."""
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--user-agent", USER_AGENT,
+        "--no-check-certificate",
+        "--geo-bypass",
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
+        "--referer", "https://www.google.com/"
+    ]
+    # Agar cookies.txt maujood hai toh use use karein
+    if os.path.exists(COOKIES_FILE):
+        cmd.extend(["--cookies", COOKIES_FILE])
+    return cmd
 
 def get_formats(url: str) -> list[dict]:
-    """Return list of available video formats via yt-dlp JSON."""
-    cmd = ["yt-dlp", "--dump-json", "--no-playlist", url]
+    cmd = get_yt_dlp_base_cmd(url) + ["--dump-json", url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
+            logger.error(f"yt-dlp error: {result.stderr}")
             return []
+        
         info = json.loads(result.stdout)
         formats = info.get("formats", [])
 
-        # Keep only video+audio combined OR video-only formats with a height
         seen_heights = set()
         quality_list = []
-        for f in reversed(formats):          # best quality first
+        for f in reversed(formats):
             height = f.get("height")
             ext    = f.get("ext", "mp4")
             fmt_id = f.get("format_id")
-            if height and height not in seen_heights:
+            if height and height not in seen_heights and height <= 1080:
                 seen_heights.add(height)
                 quality_list.append({
                     "format_id": fmt_id,
@@ -85,230 +89,103 @@ def get_formats(url: str) -> list[dict]:
                     "ext": ext,
                     "label": f"{height}p  ({ext})"
                 })
-        # Limit to 5 options
-        return quality_list[:5]
+        return quality_list[:6]
     except Exception as e:
-        logger.error(f"get_formats error: {e}")
+        logger.error(f"get_formats exception: {e}")
         return []
 
-def build_quality_buttons(user_id: int, formats: list[dict]) -> InlineKeyboardMarkup:
-    buttons = []
-    for idx, fmt in enumerate(formats):
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📥 {fmt['label']}",
-                callback_data=f"dl|{user_id}|{idx}"
-            )
-        ])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{user_id}")])
-    return InlineKeyboardMarkup(buttons)
-
-async def progress_hook(current: int, total: int, message: Message, start_time: float):
-    """Edit message with upload progress."""
-    if total == 0:
-        return
-    pct   = current * 100 // total
-    done  = pct // 5          # each block = 5 %
-    bar   = "█" * done + "░" * (20 - done)
-    speed = current / (time.time() - start_time + 0.001)
-    speed_kb = speed / 1024
-    try:
-        await message.edit_text(
-            f"📤 **Uploading…**\n`[{bar}]` **{pct}%**\n"
-            f"Speed: `{speed_kb:.1f} KB/s`"
-        )
-    except Exception:
-        pass   # ignore flood-wait etc.
-
 # ─────────────────────────────────────────
-#  BOT HANDLERS
+#  HANDLERS
 # ─────────────────────────────────────────
 @app.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
     await message.reply_text(
-        "👋 **Welcome to Video Downloader Bot!**\n\n"
-        "🔗 Just send me a link from:\n"
-        "  • 🎬 YouTube\n"
-        "  • 📸 Instagram Reels\n"
-        "  • 📘 Facebook\n\n"
-        "I'll show you quality options and download it for you! ✅"
-    )
-
-@app.on_message(filters.command("help"))
-async def help_cmd(client: Client, message: Message):
-    await message.reply_text(
-        "📖 **How to use:**\n"
-        "1. Send any YouTube / Instagram / Facebook link\n"
-        "2. Choose your preferred quality\n"
-        "3. Wait for the download & upload\n\n"
-        "⚠️ Large files (>2 GB) may fail due to Telegram limits."
+        "👋 **AstraToonix Video Downloader (2026 Edition)**\n\n"
+        "Send me any link from YouTube, Insta, or FB.\n"
+        "I will fetch HD qualities for you! ✅"
     )
 
 @app.on_message(filters.text & filters.private)
 async def handle_link(client: Client, message: Message):
     url = message.text.strip()
-    if not is_supported(url):
-        await message.reply_text(
-            "❌ **Unsupported link!**\n"
-            "Please send a YouTube, Instagram, or Facebook URL."
-        )
+    if not url.startswith("http"):
         return
 
-    platform = detect_platform(url)
-    status_msg = await message.reply_text(f"🔍 Fetching formats for {platform}…")
-
+    status_msg = await message.reply_text("🔍 Analyzing link (Bypassing security)...")
+    
+    # Run in executor to avoid blocking
     formats = await asyncio.get_event_loop().run_in_executor(None, get_formats, url)
 
     if not formats:
         await status_msg.edit_text(
-            "⚠️ Could not fetch formats.\n"
-            "The link may be private, age-restricted, or unsupported."
+            "❌ **Could not fetch formats.**\n\n"
+            "Possible reasons:\n"
+            "1. YouTube/Insta blocked the server IP.\n"
+            "2. Link is private or age-restricted.\n"
+            "3. `cookies.txt` is missing or expired."
         )
         return
 
     user_id = message.from_user.id
     user_data[user_id] = {"url": url, "formats": formats}
 
-    await status_msg.edit_text(
-        f"✅ **{platform}** link detected!\n"
-        f"Choose your preferred quality 👇",
-        reply_markup=build_quality_buttons(user_id, formats)
-    )
+    buttons = []
+    for idx, fmt in enumerate(formats):
+        buttons.append([InlineKeyboardButton(f"📥 {fmt['label']}", callback_data=f"dl|{user_id}|{idx}")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel")])
 
-@app.on_callback_query(filters.regex(r"^cancel\|"))
-async def cancel_cb(client: Client, cb: CallbackQuery):
-    uid = int(cb.data.split("|")[1])
-    user_data.pop(uid, None)
-    await cb.message.edit_text("🚫 Download cancelled.")
+    await status_msg.edit_text(
+        "✅ Link detected! Choose quality:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 @app.on_callback_query(filters.regex(r"^dl\|"))
 async def download_cb(client: Client, cb: CallbackQuery):
     _, uid_str, idx_str = cb.data.split("|")
-    user_id = int(uid_str)
-    idx     = int(idx_str)
+    user_id, idx = int(uid_str), int(idx_str)
 
     if user_id not in user_data:
-        await cb.answer("Session expired. Send the link again.", show_alert=True)
+        await cb.answer("Expired. Send link again.", show_alert=True)
         return
 
-    url     = user_data[user_id]["url"]
-    formats = user_data[user_id]["formats"]
-    fmt     = formats[idx]
+    url = user_data[user_id]["url"]
+    fmt = user_data[user_id]["formats"][idx]
 
-    await cb.answer()
-    status_msg = await cb.message.edit_text(
-        f"⬇️ **Downloading** `{fmt['label']}`…\n`[░░░░░░░░░░░░░░░░░░░░]` 0%"
-    )
+    await cb.answer("Download started...")
+    status_msg = await cb.message.edit_text(f"⬇️ Downloading `{fmt['label']}`...")
 
-    output_template = os.path.join(DOWNLOAD_DIR, f"{user_id}_%(title).60s.%(ext)s")
-
-    # 2026 Updated yt-dlp command for HD & Security bypass
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-f", "bestvideo[height<=1080]+bestaudio/best",  # Strict 1080p for Telegram 2GB limit
+    output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(time.time())}.mp4")
+    
+    cmd = get_yt_dlp_base_cmd(url) + [
+        "-f", f"{fmt['format_id']}+bestaudio/best",
         "--merge-output-format", "mp4",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "--referer", "https://www.youtube.com/",
-        "--no-check-certificate",
-        "--geo-bypass",
-        "--sleep-interval", "3",  # Rate-limit se bachne ke liye
-        "--newline",
-        "-o", output_template,
+        "-o", output_path,
         url
     ]
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-        last_edit = 0
-        downloaded_file = None
-
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="ignore").strip()
-
-            # Parse yt-dlp progress lines
-            if "[download]" in line and "%" in line:
-                try:
-                    pct_str = line.split("%")[0].split()[-1]
-                    pct     = float(pct_str)
-                    done    = int(pct / 5)
-                    bar     = "█" * done + "░" * (20 - done)
-                    now     = time.time()
-                    if now - last_edit > 2:          # throttle edits
-                        await status_msg.edit_text(
-                            f"⬇️ **Downloading** `{fmt['label']}`…\n"
-                            f"`[{bar}]` **{pct:.1f}%**"
-                        )
-                        last_edit = now
-                except Exception:
-                    pass
-
-            # Capture the final filename
-            if "[Merger]" in line or "Destination:" in line or "[download] Destination:" in line:
-                parts = line.split("Destination:")
-                if len(parts) > 1:
-                    downloaded_file = parts[1].strip()
-
+        proc = await asyncio.create_subprocess_exec(*cmd)
         await proc.wait()
 
-        # If we didn't capture via Merger line, glob for the file
-        if not downloaded_file:
-            import glob
-            files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{user_id}_*.mp4"))
-            if files:
-                downloaded_file = max(files, key=os.path.getctime)
-
-        if not downloaded_file or not os.path.exists(downloaded_file):
-            await status_msg.edit_text("❌ Download failed. The file was not created.")
+        if not os.path.exists(output_path):
+            await status_msg.edit_text("❌ Download failed at server level.")
             return
 
-        file_size_mb = os.path.getsize(downloaded_file) / (1024 * 1024)
-        if file_size_mb > 2000:
-            await status_msg.edit_text(
-                f"❌ File too large ({file_size_mb:.1f} MB).\n"
-                "Telegram bots can only upload files up to 2 GB."
-            )
-            os.remove(downloaded_file)
-            return
-
-        await status_msg.edit_text("📤 **Uploading to Telegram…**\n`[░░░░░░░░░░░░░░░░░░░░]` 0%")
-        start_time = time.time()
-
+        await status_msg.edit_text("📤 Uploading to Telegram...")
         await client.send_video(
             chat_id=cb.message.chat.id,
-            video=downloaded_file,
-            caption=f"✅ Downloaded in **{fmt['label']}**\n🤖 @YourBotUsername",
-            supports_streaming=True,
-            progress=progress_hook,
-            progress_args=(status_msg, start_time),
+            video=output_path,
+            caption=f"✅ Quality: {fmt['label']}\n🚀 Powered by AstraToonix",
+            supports_streaming=True
         )
-
-        await status_msg.edit_text("✅ **Done!** Video sent successfully.")
-
+        await status_msg.delete()
     except Exception as e:
-        logger.error(f"Download/upload error: {e}")
-        await status_msg.edit_text(f"❌ Error: `{e}`")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
     finally:
-        # Cleanup — delete file from server
-        if downloaded_file and os.path.exists(downloaded_file):
-            os.remove(downloaded_file)
-            logger.info(f"Cleaned up: {downloaded_file}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
         user_data.pop(user_id, None)
 
-# ─────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────
 if __name__ == "__main__":
-    # Start Flask in background thread
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask health-check server started.")
-
-    # Start Pyrogram bot
-    logger.info("Starting Telegram bot…")
+    Thread(target=run_flask, daemon=True).start()
     app.run()
